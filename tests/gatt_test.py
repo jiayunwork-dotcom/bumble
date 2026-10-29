@@ -43,7 +43,10 @@ from bumble.device import Device, Peer
 from bumble.gatt import (
     GATT_BATTERY_LEVEL_CHARACTERISTIC,
     GATT_CLIENT_CHARACTERISTIC_CONFIGURATION_DESCRIPTOR,
+    GATT_CLIENT_SUPPORTED_FEATURES_CHARACTERISTIC,
+    GATT_DATABASE_HASH_CHARACTERISTIC,
     GATT_MAX_ATTRIBUTE_VALUE_SIZE,
+    GATT_SERVICE_CHANGED_CHARACTERISTIC,
     Characteristic,
     CharacteristicValue,
     Descriptor,
@@ -1930,6 +1933,325 @@ async def test_write_long_value_gap_rejected():
     assert response.error_code == att.ATT_INVALID_OFFSET_ERROR
     await async_barrier()
     assert characteristic.value is None
+
+
+# -----------------------------------------------------------------------------
+# Robust Caching tests (Vol 3, Part G - 2.5.2.1)
+# -----------------------------------------------------------------------------
+async def _setup_robust_caching_devices():
+    devices = await TwoDevices.create_with_connection()
+    [_, server] = devices
+
+    write_queue = asyncio.Queue()
+    characteristic = Characteristic(
+        'CD01',
+        Characteristic.Properties.READ
+        | Characteristic.Properties.WRITE
+        | Characteristic.Properties.NOTIFY,
+        Characteristic.Permissions.READABLE | Characteristic.Permissions.WRITEABLE,
+        CharacteristicValue(
+            read=lambda connection: b'4321',
+            write=lambda connection, value: write_queue.put_nowait(value),
+        ),
+    )
+    service = Service('AB01', [characteristic])
+    server.add_service(service)
+
+    connection = devices.connections[0]
+    client = connection.gatt_client
+    peer = Peer(connection)
+    await peer.discover_services()
+    await peer.discover_characteristics()
+
+    return (
+        devices,
+        client,
+        characteristic,
+        write_queue,
+        peer.get_characteristics_by_uuid(GATT_CLIENT_SUPPORTED_FEATURES_CHARACTERISTIC)[
+            0
+        ],
+        peer.get_characteristics_by_uuid(GATT_DATABASE_HASH_CHARACTERISTIC)[0],
+        peer.get_characteristics_by_uuid(UUID('CD01'))[0],
+    )
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_client_supported_features_bit_clearing_rejected():
+    (
+        devices,
+        _,
+        _,
+        _,
+        client_supported_features,
+        _,
+        _,
+    ) = await _setup_robust_caching_devices()
+
+    # The value defaults to all-zero for a fresh connection
+    assert await client_supported_features.read_value() == b'\x00'
+
+    # Setting the Robust Caching bit succeeds and is persisted
+    await client_supported_features.write_value(b'\x01', with_response=True)
+    assert await client_supported_features.read_value() == b'\x01'
+
+    # Clearing a bit that was set is rejected with Value Not Allowed
+    with pytest.raises(ATT_Error) as error:
+        await client_supported_features.write_value(b'\x00', with_response=True)
+    assert error.value.error_code == ErrorCode.VALUE_NOT_ALLOWED
+    assert await client_supported_features.read_value() == b'\x01'
+
+    # Adding more bits is allowed
+    await client_supported_features.write_value(b'\x03', with_response=True)
+    assert await client_supported_features.read_value() == b'\x03'
+    with pytest.raises(ATT_Error) as error:
+        await client_supported_features.write_value(b'\x01', with_response=True)
+    assert error.value.error_code == ErrorCode.VALUE_NOT_ALLOWED
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_robust_caching_database_out_of_sync():
+    (
+        devices,
+        client,
+        characteristic,
+        write_queue,
+        client_supported_features,
+        database_hash,
+        characteristic_proxy,
+    ) = await _setup_robust_caching_devices()
+    server = devices[1]
+
+    # Subscribe to notifications and warm up the client cache
+    notifications = asyncio.Queue()
+    await characteristic_proxy.subscribe(notifications.put_nowait, prefer_notify=True)
+    await server.gatt_server.notify_subscribers(characteristic, b'0001')
+    assert await notifications.get() == b'0001'
+    assert client.cached_values
+
+    # Client declares support for robust caching
+    await client_supported_features.write_value(b'\x01', with_response=True)
+
+    # The database changes: the client becomes change-unaware
+    server.add_service(Service('AB02', []))
+
+    # The first request gets a Database Out Of Sync error and is not executed
+    response = await client.send_request(
+        att.ATT_Write_Request(
+            attribute_handle=characteristic_proxy.handle,
+            attribute_value=b'first',
+        )
+    )
+    assert isinstance(response, att.ATT_Error_Response)
+    assert response.error_code == ErrorCode.DATABASE_OUT_OF_SYNC
+    assert response.attribute_handle_in_error == characteristic_proxy.handle
+    await async_barrier()
+    assert write_queue.empty()
+
+    # The client cache is invalidated on the 0x12 error
+    assert client.services == []
+    assert client.cached_values == {}
+
+    # Requests on this bearer are answered normally again
+    response = await client.send_request(
+        att.ATT_Read_Request(attribute_handle=characteristic_proxy.handle)
+    )
+    assert isinstance(response, att.ATT_Read_Response)
+    assert response.attribute_value == b'4321'
+
+    # Commands from a change-unaware client are ignored
+    await client.send_command(
+        att.ATT_Write_Command(
+            attribute_handle=characteristic_proxy.handle,
+            attribute_value=b'cmd1',
+        )
+    )
+    await async_barrier()
+    assert write_queue.empty()
+
+    # Notifications are not sent to a change-unaware client
+    await server.gatt_server.notify_subscribers(characteristic, b'1111')
+    await async_barrier()
+    assert notifications.empty()
+
+    # Reading the Database Hash always succeeds
+    response = await client.send_request(
+        att.ATT_Read_Request(attribute_handle=database_hash.handle)
+    )
+    assert isinstance(response, att.ATT_Read_Response)
+    assert len(response.attribute_value) == 16
+
+    # The client is still change-unaware until its next request: commands are
+    # still ignored
+    await client.send_command(
+        att.ATT_Write_Command(
+            attribute_handle=characteristic_proxy.handle,
+            attribute_value=b'cmd2',
+        )
+    )
+    await async_barrier()
+    assert write_queue.empty()
+
+    # The next request makes the client change-aware again
+    response = await client.send_request(
+        att.ATT_Read_Request(attribute_handle=characteristic_proxy.handle)
+    )
+    assert isinstance(response, att.ATT_Read_Response)
+    assert response.attribute_value == b'4321'
+
+    # Commands are executed again
+    await client.send_command(
+        att.ATT_Write_Command(
+            attribute_handle=characteristic_proxy.handle,
+            attribute_value=b'cmd3',
+        )
+    )
+    assert await write_queue.get() == b'cmd3'
+
+    # Notifications are delivered again
+    await server.gatt_server.notify_subscribers(characteristic, b'2222')
+    assert await notifications.get() == b'2222'
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_robust_caching_disabled_client_unaffected():
+    devices = await TwoDevices.create_with_connection()
+    [_, server] = devices
+
+    write_queue = asyncio.Queue()
+    characteristic = Characteristic(
+        'CD01',
+        Characteristic.Properties.READ
+        | Characteristic.Properties.WRITE
+        | Characteristic.Properties.NOTIFY,
+        Characteristic.Permissions.READABLE | Characteristic.Permissions.WRITEABLE,
+        CharacteristicValue(
+            read=lambda connection: b'4321',
+            write=lambda connection, value: write_queue.put_nowait(value),
+        ),
+    )
+    server.add_service(Service('AB01', [characteristic]))
+
+    connection = devices.connections[0]
+    client = connection.gatt_client
+    peer = Peer(connection)
+    await peer.discover_services()
+    await peer.discover_characteristics()
+    characteristic_proxy = peer.get_characteristics_by_uuid(UUID('CD01'))[0]
+    notifications = asyncio.Queue()
+    await characteristic_proxy.subscribe(notifications.put_nowait, prefer_notify=True)
+
+    # The database changes without the client ever enabling robust caching
+    server.add_service(Service('AB02', []))
+
+    # Requests, commands and notifications behave as usual
+    response = await client.send_request(
+        att.ATT_Read_Request(attribute_handle=characteristic_proxy.handle)
+    )
+    assert isinstance(response, att.ATT_Read_Response)
+    assert response.attribute_value == b'4321'
+
+    await client.send_command(
+        att.ATT_Write_Command(
+            attribute_handle=characteristic_proxy.handle,
+            attribute_value=b'cmd',
+        )
+    )
+    assert await write_queue.get() == b'cmd'
+
+    await server.gatt_server.notify_subscribers(characteristic, b'1111')
+    assert await notifications.get() == b'1111'
+    assert client.services  # cache untouched
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_robust_caching_database_out_of_sync_per_bearer():
+    devices = await TwoDevices.create_with_connection()
+    [_, server] = devices
+    server.gatt_server.register_eatt()
+
+    characteristic = Characteristic(
+        'CD01',
+        Characteristic.Properties.READ,
+        Characteristic.Permissions.READABLE,
+        b'4321',
+    )
+    server.add_service(Service('AB01', [characteristic]))
+
+    base_client = devices.connections[0].gatt_client
+    peer = Peer(devices.connections[0])
+    await peer.discover_services()
+    await peer.discover_characteristics()
+    client_supported_features = peer.get_characteristics_by_uuid(
+        GATT_CLIENT_SUPPORTED_FEATURES_CHARACTERISTIC
+    )[0]
+    characteristic_proxy = peer.get_characteristics_by_uuid(UUID('CD01'))[0]
+
+    # Robust caching is enabled on the base bearer, then two EATT bearers open
+    await client_supported_features.write_value(b'\x01', with_response=True)
+    eatt_client1 = await gatt_client.Client.connect_eatt(devices.connections[0])
+    eatt_client2 = await gatt_client.Client.connect_eatt(devices.connections[0])
+
+    # The database changes: each bearer gets one Database Out Of Sync error
+    server.add_service(Service('AB02', []))
+
+    async def check_bearer(bearer_client):
+        response = await bearer_client.send_request(
+            att.ATT_Read_Request(attribute_handle=characteristic_proxy.handle)
+        )
+        assert isinstance(response, att.ATT_Error_Response)
+        assert response.error_code == ErrorCode.DATABASE_OUT_OF_SYNC
+
+        # Subsequent requests on this bearer execute normally
+        response = await bearer_client.send_request(
+            att.ATT_Read_Request(attribute_handle=characteristic_proxy.handle)
+        )
+        assert isinstance(response, att.ATT_Read_Response)
+        assert response.attribute_value == b'4321'
+
+        # A Database Out Of Sync error is sent only once per bearer
+        response = await bearer_client.send_request(
+            att.ATT_Read_Request(attribute_handle=characteristic_proxy.handle)
+        )
+        assert isinstance(response, att.ATT_Read_Response)
+
+    for bearer_client in (base_client, eatt_client1, eatt_client2):
+        await check_bearer(bearer_client)
+
+
+# -----------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_service_changed_indication_invalidates_cache():
+    devices = await TwoDevices.create_with_connection()
+    [_, server] = devices
+    assert server.gatt_service is not None
+    service_changed_characteristic = server.gatt_service.service_changed_characteristic
+    assert service_changed_characteristic is not None
+
+    connection = devices.connections[0]
+    client = connection.gatt_client
+    peer = Peer(connection)
+    await peer.discover_services()
+    await peer.discover_characteristics()
+    assert client.services
+
+    service_changed_proxy = peer.get_characteristics_by_uuid(
+        GATT_SERVICE_CHANGED_CHARACTERISTIC
+    )[0]
+    indications = asyncio.Queue()
+    await service_changed_proxy.subscribe(indications.put_nowait, prefer_notify=False)
+
+    await server.indicate_subscribers(service_changed_characteristic, b'1234')
+    await async_barrier()
+    assert await indications.get() == b'1234'
+
+    # The cached services are invalidated, but the indication was still
+    # delivered and confirmed
+    assert client.services == []
 
 
 # -----------------------------------------------------------------------------

@@ -51,6 +51,7 @@ from bumble.gatt import (
     GATT_PRIMARY_SERVICE_ATTRIBUTE_TYPE,
     GATT_REQUEST_TIMEOUT,
     GATT_SECONDARY_SERVICE_ATTRIBUTE_TYPE,
+    GATT_SERVICE_CHANGED_CHARACTERISTIC,
     Characteristic,
     ClientCharacteristicConfigurationBits,
     InvalidServiceError,
@@ -1179,6 +1180,14 @@ class Client:
                     )
                     return
 
+            # A Database Out Of Sync error invalidates the cached services
+            # and attribute values. See Bluetooth spec Vol 3, Part G - 2.5.2.1.
+            if (
+                isinstance(att_pdu, att.ATT_Error_Response)
+                and att_pdu.error_code == att.ErrorCode.DATABASE_OUT_OF_SYNC
+            ):
+                self.invalidate_cache()
+
             # Return the response to the coroutine that is waiting for it
             assert self.pending_response is not None
             self.pending_response.set_result(att_pdu)
@@ -1216,6 +1225,11 @@ class Client:
     def on_att_handle_value_indication(
         self, indication: att.ATT_Handle_Value_Indication
     ):
+        # A Service Changed indication invalidates the cached services and
+        # attribute values. See Bluetooth spec Vol 3, Part G - 2.5.2.1/3.4.
+        if self.is_service_changed_handle(indication.attribute_handle):
+            self.invalidate_cache()
+
         # Call all subscribers
         subscribers = self.indication_subscribers.get(
             indication.attribute_handle, set()
@@ -1232,6 +1246,28 @@ class Client:
 
         # Confirm that we received the indication
         self.send_confirmation(att.ATT_Handle_Value_Confirmation())
+
+    def is_service_changed_handle(self, attribute_handle: int) -> bool:
+        '''
+        Check whether an attribute handle corresponds to the Service Changed
+        characteristic of a discovered service.
+        '''
+        return any(
+            characteristic.handle == attribute_handle
+            for service in self.services
+            for characteristic in service.characteristics
+            if characteristic.uuid == GATT_SERVICE_CHANGED_CHARACTERISTIC
+        )
+
+    def invalidate_cache(self) -> None:
+        '''
+        Invalidate all cached services and attribute values, e.g. upon receiving
+        a Database Out Of Sync error or a Service Changed indication. The
+        caller is expected to perform service discovery again.
+        '''
+        logger.debug(f'invalidating GATT cache for {self._bearer_id}')
+        self.services = []
+        self.cached_values.clear()
 
     def cache_value(self, attribute_handle: int, value: bytes) -> None:
         self.cached_values[attribute_handle] = (

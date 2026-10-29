@@ -37,18 +37,22 @@ from bumble.colors import color
 from bumble.gatt import (
     GATT_CHARACTERISTIC_ATTRIBUTE_TYPE,
     GATT_CLIENT_CHARACTERISTIC_CONFIGURATION_DESCRIPTOR,
+    GATT_DATABASE_HASH_CHARACTERISTIC,
     GATT_MAX_ATTRIBUTE_VALUE_SIZE,
     GATT_PRIMARY_SERVICE_ATTRIBUTE_TYPE,
     GATT_REQUEST_TIMEOUT,
     GATT_SECONDARY_SERVICE_ATTRIBUTE_TYPE,
+    GATT_SERVICE_CHANGED_CHARACTERISTIC,
     Characteristic,
     CharacteristicDeclaration,
+    ClientSupportedFeatures,
     Descriptor,
     IncludedServiceDeclaration,
     Service,
 )
 
 if TYPE_CHECKING:
+    from bumble import device
     from bumble.device import Device
 
 # -----------------------------------------------------------------------------
@@ -79,6 +83,32 @@ def _bearer_id(bearer: att.Bearer) -> str:
 
 
 # -----------------------------------------------------------------------------
+# Robust Caching state, per connected client (ACL connection)
+# -----------------------------------------------------------------------------
+class RobustCachingClientState:
+    '''
+    State for a client that has written the Client Supported Features
+    characteristic. See Bluetooth spec Vol 3, Part G - 2.5.2.1.
+    '''
+
+    def __init__(self) -> None:
+        # Client Supported Features bitmask
+        self.features = 0
+
+        # Whether the client is currently change-unaware, i.e. the database
+        # was modified after the client last read the Database Hash
+        self.change_unaware = False
+
+        # Whether the client has read the Database Hash during the current
+        # change-unaware episode; the next request makes it change-aware
+        self.database_hash_read = False
+
+        # Bearers on which a Database Out Of Sync error has already been sent
+        # during the current change-unaware episode (once per bearer)
+        self.out_of_sync_bearers: set[att.Bearer] = set()
+
+
+# -----------------------------------------------------------------------------
 # GATT Server
 # -----------------------------------------------------------------------------
 class Server(utils.EventEmitter):
@@ -88,6 +118,8 @@ class Server(utils.EventEmitter):
     subscribers: dict[att.Bearer, dict[int, bytes]]
     indication_semaphores: defaultdict[att.Bearer, asyncio.Semaphore]
     pending_confirmations: defaultdict[att.Bearer, asyncio.futures.Future | None]
+    # Robust caching state, keyed by ACL connection handle
+    robust_caching_clients: dict[int, RobustCachingClientState]
 
     EVENT_CHARACTERISTIC_SUBSCRIPTION = "characteristic_subscription"
 
@@ -107,6 +139,8 @@ class Server(utils.EventEmitter):
         self.pending_confirmations = defaultdict(lambda: None)
         # Queued prepared writes, per bearer
         self.prepared_writes: dict[att.Bearer, list[tuple[int, int, bytes]]] = {}
+        # Robust caching state for clients that wrote their supported features
+        self.robust_caching_clients = {}
 
     def __str__(self) -> str:
         return "\n".join(map(str, self.attributes))
@@ -122,6 +156,10 @@ class Server(utils.EventEmitter):
             )
             channel.sink = lambda pdu: self.on_gatt_pdu(
                 channel, att.ATT_PDU.from_bytes(pdu)
+            )
+            channel.on(
+                channel.EVENT_CLOSE,
+                lambda channel=channel: self.on_bearer_disconnection(channel),
             )
 
         return self.device.create_l2cap_server(
@@ -307,9 +345,134 @@ class Server(utils.EventEmitter):
         service.end_group_handle = self.attributes[-1].handle
         self.services.append(service)
 
+        # The database has changed: clients supporting robust caching become
+        # change-unaware. See Bluetooth spec Vol 3, Part G - 2.5.2.1.
+        self.on_database_changed()
+
     def add_services(self, services: Iterable[Service]) -> None:
         for service in services:
             self.add_service(service)
+
+    # -------------------------------------------------------------------------
+    # Robust caching
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def _connection_handle(bearer: att.Bearer) -> int:
+        if att.is_enhanced_bearer(bearer):
+            return bearer.connection.handle
+        return bearer.handle
+
+    def on_database_changed(self) -> None:
+        '''
+        Mark all clients supporting robust caching as change-unaware.
+        '''
+        for client_state in self.robust_caching_clients.values():
+            if client_state.features & ClientSupportedFeatures.ROBUST_CACHING:
+                client_state.change_unaware = True
+                client_state.database_hash_read = False
+                client_state.out_of_sync_bearers.clear()
+
+    def on_bearer_disconnection(self, bearer: att.Bearer) -> None:
+        # Discard per-bearer robust caching state (enhanced bearer closed)
+        client_state = self.robust_caching_clients.get(self._connection_handle(bearer))
+        if client_state is not None:
+            client_state.out_of_sync_bearers.discard(bearer)
+
+    def get_client_supported_features(self, connection: device.Connection) -> int:
+        client_state = self.robust_caching_clients.get(connection.handle)
+        return client_state.features if client_state is not None else 0
+
+    def set_client_supported_features(
+        self, connection: device.Connection, value: bytes
+    ) -> None:
+        '''
+        See Bluetooth spec Vol 3, Part G - 7.2: a client shall not clear any
+        bits it has set, such a write is rejected with Value Not Allowed.
+        '''
+        if len(value) != 1:
+            raise att.ATT_Error(error_code=att.ErrorCode.INVALID_ATTRIBUTE_LENGTH)
+
+        client_state = self.robust_caching_clients.setdefault(
+            connection.handle, RobustCachingClientState()
+        )
+        new_features = value[0]
+        if client_state.features & ~new_features:
+            logger.debug(
+                f'Client Supported Features bit cleared for '
+                f'connection=0x{connection.handle:04X}: '
+                f'{client_state.features:02X} -> {new_features:02X}'
+            )
+            raise att.ATT_Error(error_code=att.ErrorCode.VALUE_NOT_ALLOWED)
+        client_state.features = new_features
+
+    def _is_client_change_unaware(self, bearer: att.Bearer) -> bool:
+        client_state = self.robust_caching_clients.get(self._connection_handle(bearer))
+        return (
+            client_state is not None
+            and bool(client_state.features & ClientSupportedFeatures.ROBUST_CACHING)
+            and client_state.change_unaware
+        )
+
+    def _handle_robust_caching(self, bearer: att.Bearer, att_pdu: att.ATT_PDU) -> bool:
+        '''
+        Enforce robust caching rules for a change-unaware client.
+
+        Returns True if the PDU has been handled (ignored or answered with a
+        Database Out Of Sync error), False if normal processing shall proceed.
+        '''
+        client_state = self.robust_caching_clients.get(self._connection_handle(bearer))
+        if client_state is None or not client_state.change_unaware:
+            return False
+
+        # ATT commands from a change-unaware client are ignored
+        if att_pdu.is_command:
+            logger.debug(
+                f'ignoring command from change-unaware client '
+                f'{_bearer_id(bearer)}: {att_pdu}'
+            )
+            return True
+
+        if att_pdu.op_code not in att.ATT_REQUESTS:
+            return False
+
+        # Reading the Database Hash always succeeds and does not count as the
+        # first request; the client becomes change-aware on its next request
+        if (
+            att_pdu.op_code == att.Opcode.ATT_READ_REQUEST
+            and (attribute_handle := getattr(att_pdu, 'attribute_handle', None))
+            is not None
+            and (attribute := self.get_attribute(attribute_handle)) is not None
+            and attribute.type == GATT_DATABASE_HASH_CHARACTERISTIC
+        ):
+            client_state.database_hash_read = True
+            return False
+
+        if client_state.database_hash_read:
+            # This is the request following the Database Hash read: the client
+            # is change-aware again
+            client_state.change_unaware = False
+            client_state.database_hash_read = False
+            client_state.out_of_sync_bearers.clear()
+            return False
+
+        # The first request on each bearer gets a single Database Out Of Sync
+        # error and is not executed
+        if bearer not in client_state.out_of_sync_bearers:
+            client_state.out_of_sync_bearers.add(bearer)
+            logger.debug(
+                f'sending Database Out Of Sync to change-unaware client '
+                f'{_bearer_id(bearer)}: {att_pdu}'
+            )
+            response = att.ATT_Error_Response(
+                request_opcode_in_error=att_pdu.op_code,
+                attribute_handle_in_error=getattr(att_pdu, 'attribute_handle', 0x0000)
+                or 0x0000,
+                error_code=att.ErrorCode.DATABASE_OUT_OF_SYNC,
+            )
+            self.send_response(bearer, response)
+            return True
+
+        return False
 
     def make_descriptor_value(
         self, characteristic: Characteristic
@@ -399,6 +562,15 @@ class Server(utils.EventEmitter):
         value: _T | None,
         force: bool,
     ) -> None:
+        # Do not notify a change-unaware client (except for the Service Changed
+        # characteristic). See Bluetooth spec Vol 3, Part G - 2.5.2.1.
+        if (
+            attribute.type != GATT_SERVICE_CHANGED_CHARACTERISTIC
+            and self._is_client_change_unaware(bearer)
+        ):
+            logger.debug(f'not notifying change-unaware client {_bearer_id(bearer)}')
+            return
+
         # Check if there's a subscriber
         if not force:
             subscribers = self.subscribers.get(bearer)
@@ -461,6 +633,17 @@ class Server(utils.EventEmitter):
         value: _T | None,
         force: bool,
     ) -> None:
+        # Do not indicate to a change-unaware client (except for the Service
+        # Changed characteristic). See Bluetooth spec Vol 3, Part G - 2.5.2.1.
+        if (
+            attribute.type != GATT_SERVICE_CHANGED_CHARACTERISTIC
+            and self._is_client_change_unaware(bearer)
+        ):
+            logger.debug(
+                f'not indicating to change-unaware client {_bearer_id(bearer)}'
+            )
+            return
+
         # Check if there's a subscriber
         if not force:
             subscribers = self.subscribers.get(bearer)
@@ -563,9 +746,16 @@ class Server(utils.EventEmitter):
         self.indication_semaphores.pop(bearer, None)
         self.pending_confirmations.pop(bearer, None)
         self.prepared_writes.pop(bearer, None)
+        if not att.is_enhanced_bearer(bearer):
+            self.robust_caching_clients.pop(bearer.handle, None)
 
     def on_gatt_pdu(self, bearer: att.Bearer, att_pdu: att.ATT_PDU) -> None:
         logger.debug(f'GATT Request to server: {_bearer_id(bearer)} {att_pdu}')
+
+        # Enforce robust caching for change-unaware clients
+        if self._handle_robust_caching(bearer, att_pdu):
+            return
+
         handler_name = f'on_{att_pdu.name.lower()}'
         handler = getattr(self, handler_name, None)
         if handler is not None:

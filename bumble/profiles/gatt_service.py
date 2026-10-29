@@ -80,7 +80,11 @@ class GenericAttributeProfileService(gatt.TemplateService):
                     gatt.Characteristic.Permissions.READABLE
                     | gatt.Characteristic.Permissions.WRITEABLE
                 ),
-                value=bytes(1),
+                # The value is per connected client and held by the GATT server
+                value=gatt.CharacteristicValue(
+                    read=self.get_client_supported_features,
+                    write=self.set_client_supported_features,
+                ),
             )
 
         super().__init__(
@@ -133,6 +137,18 @@ class GenericAttributeProfileService(gatt.TemplateService):
 
         # Hash is a uint128, so send least significant octet first.
         return crypto.aes_cmac(m=m, k=bytes(16))[::-1]
+
+    def get_client_supported_features(self, connection: device.Connection) -> bytes:
+        '''See Vol 3, Part G - 7.2. The value is per connected client.'''
+        return bytes(
+            [connection.device.gatt_server.get_client_supported_features(connection)]
+        )
+
+    def set_client_supported_features(
+        self, connection: device.Connection, value: bytes
+    ) -> None:
+        '''See Vol 3, Part G - 7.2. The value is per connected client.'''
+        connection.device.gatt_server.set_client_supported_features(connection, value)
 
 
 class GenericAttributeProfileServiceProxy(gatt_client.ProfileServiceProxy):
